@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Any
 import asyncio
 import hashlib
+from datetime import datetime  # <-- добавлено
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -64,6 +65,7 @@ class IndexAPIItem(BaseModel):
     dense_content: str
     sparse_content: str
     message_ids: list[str]
+    metadata: dict[str, Any]  # <-- добавлено
 
 
 class IndexAPIResponse(BaseModel):
@@ -94,7 +96,8 @@ SPARSE_MODEL_NAME = "Qdrant/bm25"
 FASTEMBED_CACHE_PATH = "/models/fastembed"
 
 # Важная переманная, которая позволяет вычислять sparse вектор в несколько ядер. Не рекомендуется изменять.
-UVICORN_WORKERS=8
+UVICORN_WORKERS = 8
+
 
 def render_message(message: Message) -> str:
     text = ""
@@ -116,6 +119,7 @@ def render_message(message: Message) -> str:
 
 
 def build_chunks(
+    chat: Chat,  # <-- добавлен параметр
     overlap_messages: list[Message],
     new_messages: list[Message],
 ) -> list[IndexAPIItem]:
@@ -157,8 +161,12 @@ def build_chunks(
 
     new_text, new_message_ranges = build_text_and_ranges(new_messages)
 
+    # Для быстрого доступа к сообщениям по id
+    new_messages_by_id = {msg.id: msg for msg in new_messages}
+    overlap_messages_by_id = {msg.id: msg for msg in overlap_messages}
+
     for start in range(0, len(new_text), CHUNK_SIZE):
-        chunk_body = new_text[start : start + CHUNK_SIZE]
+        chunk_body = new_text[start: start + CHUNK_SIZE]
         if not chunk_body:
             continue
 
@@ -177,17 +185,78 @@ def build_chunks(
             chunk_text += "\n"
         chunk_text += chunk_body
 
+        # Собираем ID сообщений в чанке
+        msg_ids_in_chunk = [msg_id for _, _, msg_id in chunk_body_ranges]
+
+        # --- Формирование метаданных ---
+        # Даты начала и конца
+        times = []
+        for msg_id in msg_ids_in_chunk:
+            msg = new_messages_by_id.get(msg_id) or overlap_messages_by_id.get(msg_id)
+            if msg:
+                times.append(msg.time)
+        start_dt = datetime.fromtimestamp(min(times)).isoformat() if times else ""
+        end_dt = datetime.fromtimestamp(max(times)).isoformat() if times else ""
+
+        # Участники (из чата)
+        participants = []
+        if chat.members:
+            participants = [str(m.get("id")) for m in chat.members if m.get("id")]
+
+        # Упоминания (агрегируем из сообщений чанка)
+        mentions_set = set()
+        for msg_id in msg_ids_in_chunk:
+            msg = new_messages_by_id.get(msg_id) or overlap_messages_by_id.get(msg_id)
+            if msg and msg.mentions:
+                mentions_set.update(msg.mentions)
+
+        # Флаги пересылки и цитирования
+        contains_forward = any(
+            (new_messages_by_id.get(mid) and new_messages_by_id[mid].is_forward)
+            or (overlap_messages_by_id.get(mid) and overlap_messages_by_id[mid].is_forward)
+            for mid in msg_ids_in_chunk
+        )
+        contains_quote = any(
+            (new_messages_by_id.get(mid) and new_messages_by_id[mid].is_quote)
+            or (overlap_messages_by_id.get(mid) and overlap_messages_by_id[mid].is_quote)
+            for mid in msg_ids_in_chunk
+        )
+
+        # thread_sn – берём из первого попавшегося сообщения, у которого он есть
+        thread_sn = None
+        for msg_id in msg_ids_in_chunk:
+            msg = new_messages_by_id.get(msg_id) or overlap_messages_by_id.get(msg_id)
+            if msg and msg.thread_sn:
+                thread_sn = msg.thread_sn
+                break
+
+        metadata = {
+            "chat_name": chat.name,
+            "chat_type": chat.type,
+            "chat_id": chat.id,
+            "chat_sn": chat.sn,
+            "thread_sn": thread_sn,
+            "start": start_dt,
+            "end": end_dt,
+            "participants": participants,
+            "mentions": list(mentions_set),
+            "contains_forward": contains_forward,
+            "contains_quote": contains_quote,
+        }
+
         result.append(
             IndexAPIItem(
                 page_content=chunk_text,
                 dense_content=chunk_text,
                 sparse_content=chunk_text,
-                message_ids=[message_id for _, _, message_id in chunk_body_ranges],
+                message_ids=msg_ids_in_chunk,
+                metadata=metadata,
             )
         )
         previous_chunk_text = slice_tail(chunk_text, OVERLAP_SIZE)
 
     return result
+
 
 # Ваш сервис должен имплементировать оба этих метода
 @app.get("/health")
@@ -199,6 +268,7 @@ async def health() -> dict[str, str]:
 async def index(payload: IndexAPIRequest) -> IndexAPIResponse:
     return IndexAPIResponse(
         results=build_chunks(
+            payload.data.chat,                # <-- передаём chat
             payload.data.overlap_messages,
             payload.data.new_messages,
         )
@@ -239,6 +309,7 @@ async def sparse_embedding(payload: SparseEmbeddingRequest) -> dict[str, Any]:
     # Проверяющая система вызывает этот endpoint при создании коллекции
     vectors = await asyncio.to_thread(embed_sparse_texts, payload.texts)
     return {"vectors": vectors}
+
 
 # красивая обработка ошибок
 @app.exception_handler(Exception)

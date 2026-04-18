@@ -3,6 +3,8 @@ import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
+import time
+from datetime import datetime
 
 import httpx
 from fastembed import SparseTextEmbedding
@@ -11,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.models import Filter, FieldCondition, Range  # <-- добавлено
 
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
@@ -34,7 +37,7 @@ REQUIRED_ENV_VARS = [
     "RERANKER_URL",
     "QDRANT_URL",
 ]
- 
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
 
@@ -132,7 +135,7 @@ class SparseEmbeddingResponse(BaseModel):
 # Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
-    chat_type: str # channel, group, private, thread
+    chat_type: str  # channel, group, private, thread
     chat_id: str
     chat_sn: str
     thread_sn: str | None = None
@@ -176,6 +179,102 @@ SPRASE_PREFETCH_K = 30
 RETRIEVE_K = 20
 RERANK_LIMIT = 10
 
+
+# ---------- Функции для работы с метаданными ----------
+def build_date_filter(date_range: DateRange | None) -> Filter | None:
+    """Создаёт фильтр Qdrant по диапазону дат (используя поля metadata.start и metadata.end)."""
+    if not date_range:
+        return None
+    return Filter(
+        must=[
+            FieldCondition(
+                key="metadata.start",
+                range=Range(gte=date_range.from_),
+            ),
+            FieldCondition(
+                key="metadata.end",
+                range=Range(lte=date_range.to),
+            ),
+        ]
+    )
+
+
+def build_metadata_filter(question: Question) -> Filter | None:
+    """Создаёт фильтр по типу чата, участникам и т.д."""
+    conditions = []
+
+    # Фильтр по типу чата (если есть подсказки в тексте)
+    text_lower = question.text.lower()
+    if "личк" in text_lower or "private" in text_lower:
+        conditions.append(FieldCondition(key="metadata.chat_type", match={"value": "private"}))
+    elif "канал" in text_lower or "channel" in text_lower:
+        conditions.append(FieldCondition(key="metadata.chat_type", match={"value": "channel"}))
+    elif "групп" in text_lower or "group" in text_lower:
+        conditions.append(FieldCondition(key="metadata.chat_type", match={"value": "group"}))
+
+    # Фильтр по участникам (если в entities.people есть список)
+    if question.entities and question.entities.people:
+        conditions.append(
+            FieldCondition(
+                key="metadata.participants",
+                match={"any": question.entities.people},
+            )
+        )
+
+    if not conditions:
+        return None
+    return Filter(must=conditions)
+
+
+def combine_filters(f1: Filter | None, f2: Filter | None) -> Filter | None:
+    """Объединяет два фильтра через must."""
+    if f1 is None and f2 is None:
+        return None
+    if f1 is None:
+        return f2
+    if f2 is None:
+        return f1
+    # Объединяем условия
+    must = []
+    if f1.must:
+        must.extend(f1.must)
+    if f2.must:
+        must.extend(f2.must)
+    return Filter(must=must)
+
+
+def time_decay_score(point: Any, current_time: float | None = None) -> float:
+    """Возвращает множитель (0.1..1) на основе давности последнего сообщения в чанке."""
+    if current_time is None:
+        current_time = time.time()
+    metadata = point.payload.get("metadata", {})
+    end_str = metadata.get("end")
+    if not end_str:
+        return 1.0
+    try:
+        end_ts = datetime.fromisoformat(end_str).timestamp()
+        age_days = (current_time - end_ts) / (24 * 3600)
+        # экспоненциальное затухание: период полураспада 30 дней
+        decay = 0.5 ** (age_days / 30)
+        return max(decay, 0.1)
+    except Exception:
+        return 1.0
+
+
+def boost_by_metadata(point: Any, question: Question) -> float:
+    """Дополнительные бусты на основе метаданных."""
+    boost = 1.0
+    metadata = point.payload.get("metadata", {})
+    # Буст за пересланные сообщения
+    if metadata.get("contains_forward"):
+        boost *= 1.2
+    # Буст, если в чанке упоминается тот, кто задаёт вопрос
+    if question.asker and question.asker in metadata.get("mentions", []):
+        boost *= 1.5
+    return boost
+
+
+# ---------- Основные функции поиска ----------
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
     response = await client.post(
@@ -211,6 +310,7 @@ async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
     sparse_vector: SparseVector,
+    query_filter: Filter | None = None,  # <-- добавлен фильтр
 ) -> Any | None:
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
@@ -232,6 +332,7 @@ async def qdrant_search(
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
+        filter=query_filter,  # <-- применяем фильтр
     )
 
     if not response.points:
@@ -304,29 +405,53 @@ async def health() -> dict[str, str]:
 
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
-    query = payload.question.text.strip()
+    # Используем search_text, если он предоставлен
+    query = payload.question.search_text.strip() or payload.question.text.strip()
     if not query:
-        raise HTTPException(status_code=400, detail="question.text is required")
+        raise HTTPException(status_code=400, detail="question.text or question.search_text is required")
 
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
+    # 1. Строим фильтры по метаданным
+    date_filter = build_date_filter(payload.question.date_range)
+    metadata_filter = build_metadata_filter(payload.question)
+    combined_filter = combine_filters(date_filter, metadata_filter)
+
+    # 2. Получаем векторы
     dense_vector = await embed_dense(client, query)
     sparse_vector = await embed_sparse(query)
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
 
-    if best_points is None:
+    # 3. Поиск с фильтром
+    points = await qdrant_search(qdrant, dense_vector, sparse_vector, combined_filter)
+    if not points:
         return SearchAPIResponse(results=[])
 
-    best_points = await rerank_points(client, query, list(best_points))
+    # 4. Пост-обработка: временной decay и бустинг по метаданным
+    for point in points:
+        point.score = point.score * time_decay_score(point) * boost_by_metadata(point, payload.question)
 
-    message_ids: list[str] = [] 
-    for point in best_points:
-        message_ids += extract_message_ids(point)
+    # 5. Сортировка по новому скору
+    points = sorted(points, key=lambda p: p.score, reverse=True)
 
-    return SearchAPIResponse(
-        results=[SearchAPIItem(message_ids=message_ids)]
-    )
+    # 6. Реранк (уже на меньшем количестве кандидатов)
+    top_for_rerank = points[:RERANK_LIMIT]
+    reranked = await rerank_points(client, query, top_for_rerank)
+
+    # 7. Сбор message_ids
+    message_ids = []
+    for point in reranked:
+        message_ids.extend(extract_message_ids(point))
+
+    # Убираем дубликаты, сохраняя порядок
+    seen = set()
+    unique_ids = []
+    for mid in message_ids:
+        if mid not in seen:
+            seen.add(mid)
+            unique_ids.append(mid)
+
+    return SearchAPIResponse(results=[SearchAPIItem(message_ids=unique_ids)])
 
 
 @app.exception_handler(Exception)
