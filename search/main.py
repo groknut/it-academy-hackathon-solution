@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 
+from qdrant_client.models import Filter, FieldCondition, Range, MatchAny
+
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 # Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
@@ -34,7 +36,7 @@ REQUIRED_ENV_VARS = [
     "RERANKER_URL",
     "QDRANT_URL",
 ]
- 
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
 
@@ -167,14 +169,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 
-
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
 DENSE_PREFETCH_K = 10
 SPRASE_PREFETCH_K = 30
 RETRIEVE_K = 20
-RERANK_LIMIT = 10
+RERANK_LIMIT = 20
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
@@ -211,6 +212,7 @@ async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
     sparse_vector: SparseVector,
+    query_filter: Filter | None = None
 ) -> Any | None:
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
@@ -232,6 +234,7 @@ async def qdrant_search(
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
+        query_filter=query_filter
     )
 
     if not response.points:
@@ -244,7 +247,6 @@ def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
     metadata = payload.get("metadata") or {}
     message_ids = metadata.get("message_ids") or []
-
     return [str(message_id) for message_id in message_ids]
 
 
@@ -280,7 +282,8 @@ async def rerank_points(
     query: str,
     points: list[Any],
 ) -> list[Any]:
-    rerank_candidates = points[:10]
+
+    rerank_candidates = points[:RERANK_LIMIT]
     rerank_targets = [point.payload.get("page_content") for point in rerank_candidates]
     scores = await get_rerank_scores(client, query, rerank_targets)
 
@@ -295,6 +298,47 @@ async def rerank_points(
 
     return reranked_candidates
 
+def build_search_query(question: Question) -> str:
+    parts = [question.text.strip()]
+
+    if question.hyde:
+        parts.append(" ".join(question.hyde))
+    if question.keywords:
+        parts.append(" ".join(question.keywords))
+
+    if question.entities:
+        entities_text = []
+
+       for field_name in ("people", "emails", "documents", "names", "links"):
+            values = getattr(question.entities, field_name) or []
+            entities_text.extend(values)
+
+        if entities_text:
+            parts.append(" ".join(entities_text))
+    return " ".join(parts)
+
+def build_filter(question: Question) -> Filter | None:
+
+    must_conditions = []
+
+    if question.date_range:
+        must_conditions.append(
+            FieldCondition(
+                key="metadata.start",
+                range=Range(gte=question.date_range.from_, lte=question.date_range.to)
+            )
+        )
+
+    if question.entities and question.entities.people:
+        must_conditions.append(
+            FieldCondition(
+                key="metadata.participants",
+                match=MatchAny(any=question.entities.people)
+            )
+        )
+
+    return Filter(must=must_conditions) if must_conditions else None
+
 
 # Ваш сервис должен имплементировать оба этих метода
 @app.get("/health")
@@ -304,23 +348,27 @@ async def health() -> dict[str, str]:
 
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
-    query = payload.question.text.strip()
+    # query = payload.question.text.strip()\
+    query = build_search_query(payload.question)
+
     if not query:
         raise HTTPException(status_code=400, detail="question.text is required")
 
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
+    query_filter = build_filter(payload.question)
+
     dense_vector = await embed_dense(client, query)
     sparse_vector = await embed_sparse(query)
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector, query_filter)
 
     if best_points is None:
         return SearchAPIResponse(results=[])
 
     best_points = await rerank_points(client, query, list(best_points))
 
-    message_ids: list[str] = [] 
+    message_ids: list[str] = []
     for point in best_points:
         message_ids += extract_message_ids(point)
 
