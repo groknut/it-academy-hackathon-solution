@@ -174,7 +174,7 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 DENSE_PREFETCH_K = 10
 SPRASE_PREFETCH_K = 30
 RETRIEVE_K = 20
-RERANK_LIMIT = 30
+RERANK_LIMIT = 35
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
@@ -232,6 +232,7 @@ async def qdrant_search(
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
+        # score_threshold=0.01
     )
 
     if not response.points:
